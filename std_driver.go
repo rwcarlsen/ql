@@ -84,76 +84,154 @@ func (s *stmt) NumInput() int {
 	return -1
 }
 
-func (s *stmt) prepareCtx() error {
-	switch s.lst[0].String() {
-	case "BEGIN TRANSACTION;","COMMIT;","ROLLBACK;":
-		if s.cn.currCtx != nil {
-			return errors.New("ql: cannot nest transactions")
-		}
-		s.cn.currCtx = NewRWCtx()
-	}
-	return nil
-}
-
 func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
-	if err := s.prepareCtx(); err != nil {
-		return nil, err
+	rs, i, err := s.run(args)
+	if err != nil {
+		return nil, fmt.Errorf("ql: statement %v: %v", i, err)
 	}
-
-	if err := s.cn.Execute(vtoi(args)...); err != nil {
-		return nil, err
-	}
-	return result{s.Stmt.Conn()}, nil
+	return result{}, nil
 }
 
 func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
-	if err := s.Stmt.Query(vtoi(args)...); err != nil && err != io.EOF {
-		return nil, err
+	rs, i, err := s.run(args)
+	if err != nil {
+		return nil, fmt.Errorf("ql: statement %v: %v", i, err)
 	}
+
 	return &rows{s, true}, nil
 }
 
+func (s *stmt) run(args []driver.Value) (Recordset, int, error) {
+	switch s.lst[0].String() {
+	case beginTransactionStmt{}.String(),commitStmt{}.String(),rollbackStmt{}.String():
+		if s.cn.currCtx != nil {
+			return nil, 0, errors.New("ql: cannot nest transactions")
+		}
+		s.cn.currCtx = NewRWCtx()
+	}
+	return s.cn.Execute(s.cn.currCtx, s.lst, vtoi(args)...)
+}
+
 // result implements driver.Result.
-type result struct {
-	*Conn
+type result struct { }
+
+func (result) LastInsertId() (int64, error) {
+	return 0, nil
 }
 
-func (r result) LastInsertId() (int64, error) {
-	return int64(r.Conn.LastInsertId()), nil
-}
-
-func (r result) RowsAffected() (int64, error) {
-	return int64(r.Conn.RowsAffected()), nil
+func (result) RowsAffected() (int64, error) {
+	return 0, nil
 }
 
 // rows implements driver.Rows.
 type rows struct {
-	*stmt
+	rs Recordset
 	first bool
+	cols []string
+	ch chan []interface{}
+	done chan bool
+	closed bool
 }
 
 func (r *rows) Close() error {
-	if r.stmt.closed {
-		return r.stmt.Stmt.Close()
+	if !r.closed {
+		r.closed = true
+		if r.done != nil {
+			r.done <- true
+			close(r.done)
+			close(r.ch)
+		}
 	}
-	r.stmt.Stmt.Reset()
 	return nil
 }
 
-func (r *rows) Next(dest []driver.Value) error {
-	if r.first {
-		r.first = false
-		if !r.stmt.Stmt.Busy() {
-			return io.EOF
-		}
-	} else if err := r.stmt.Stmt.Next(); err != nil {
-		return err
+func (r *rows) Columns() []string {
+	r.init()
+	return r.cols
+}
+
+func (r *rows) init() {
+	if !r.first {
+		return
 	}
+
+	r.first = false
+	r.ch = make(chan []interface{})
+	r.done = make(chan bool, 2)
+	fn := func(data []interface) (more bool, err error) {
+		select {
+		case r.ch<-data:
+		case <-r.done:
+			return false, nil
+		default:
+			return true, nil
+		}
+	}
+
+	go func() {
+		r.rs.Do(true, fn)
+		r.ch <- []interface{}{}
+	}()
+
+	cols := <-r.ch
+	for _, c := range cols {
+		r.cols = append(r.cols, c.(string))
+	}
+}
+
+func (r *rows) Next(dest []driver.Value) error {
+	r.init()
+	if r.empty {
+		return io.EOF
+	}
+
+	row := <-r.ch
+	if len(row) == 0 {
+		r.empty = true
+		return io.EOF
+	}
+
 	for i := range dest {
-		v := (*interface{})(&dest[i])
-		err := r.stmt.Stmt.scanDynamic(C.int(i), v, true)
-		if err != nil {
-			return err
+		switch v := row[i].(type) {
+		case byte:
+			dest[i] = int64(v)
+		case complex128:
+		// unsupported (panic?)
+			dest[i] = 0
+		case complex64:
+		// unsupported (panic?)
+			dest[i] = 0
+		case float32:
+			dest[i] = float64(v)
+		case float64:
+			dest[i] = v
+		case int:
+			dest[i] = int64(v)
+		case int16:
+			dest[i] = int64(v)
+		case int32:
+			dest[i] = int64(v)
+		case int64:
+			dest[i] = v
+		case int8:
+			dest[i] = int64(v)
+		case rune:
+			dest[i] = int64(v)
+		case string:
+			dest[i] = v
+		case uint:
+			dest[i] = int64(v)
+		case uint16:
+			dest[i] = int64(v)
+		case uint32:
+			dest[i] = int64(v)
+		case uint64:
+			dest[i] = int64(v)
+		case uint8:
+			dest[i] = int64(v)
+		default:
+			panic(fmt.Sprintf("ql: unsupported data type %T", row[i])
+			dest[i] = row[i]
 		}
 	}
 	return nil
